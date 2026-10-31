@@ -1,0 +1,37 @@
+name: Build APK (debug)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/playback-stuck-self-heal]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30" "build-tools;30.0.2"
+
+      - name: Replace dead jcenter() repo with mirrors (CI only, not committed)
+        run: |
+          sed -i 's|jcenter()|mavenCentral()\n        maven { url "https://maven.aliyun.com/repository/jcenter" }|' build.gradle
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: music-player-debug
+          path: app/build/outputs/apk/debug/
