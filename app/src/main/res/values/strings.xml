@@ -182,6 +182,7 @@
     <string name="permission_external_storage_denied">Permission to access external storage denied</string>
     <string name="permissions_denied">Permissions denied</string>
     <string name="pick_from_local_storage">Pick from local storage</string>
+    <string name="playback_stuck">Playback seems stuck. Tap next to continue.</string>
     <string name="playing_notification_description">The playing notification provides actions for play/pause etc.</string>
     <string name="playing_notification_name">Playing notification</string>
     <string name="playlist_empty_text">Empty playlist</string>

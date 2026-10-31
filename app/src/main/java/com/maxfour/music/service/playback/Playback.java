@@ -38,5 +38,12 @@ public interface Playback {
         void onSongWentToNext();
 
         void onSongEnded();
+
+        /**
+         * The current player failed (e.g. a codec or read error). The player
+         * has been discarded by the implementation; the callback receiver is
+         * expected to recover (advance to the next song or stop).
+         */
+        void onPlaybackError();
     }
 }

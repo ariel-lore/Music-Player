@@ -25,9 +25,11 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.PowerManager;
 import android.os.Process;
+import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.provider.MediaStore;
 import android.support.v4.media.MediaMetadataCompat;
+import android.util.Log;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.widget.Toast;
@@ -73,6 +75,8 @@ import java.util.Random;
 
 public class MusicService extends Service implements SharedPreferences.OnSharedPreferenceChangeListener, Playback.PlaybackCallbacks {
 
+    private static final String TAG = MusicService.class.getSimpleName();
+
     public static final String MUSIC_PACKAGE_NAME = "com.maxfour.music";
 
     public static final String ACTION_TOGGLE_PAUSE = MUSIC_PACKAGE_NAME + ".togglepause";
@@ -117,6 +121,8 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     private static final int DUCK = 7;
     private static final int UNDUCK = 8;
     public static final int RESTORE_QUEUES = 9;
+    private static final int PLAYBACK_ERROR = 10;
+    private static final int PLAYBACK_WATCHDOG = 11;
 
     public static final int SHUFFLE_MODE_NONE = 0;
     public static final int SHUFFLE_MODE_SHUFFLE = 1;
@@ -148,6 +154,26 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
     private int repeatMode;
     private boolean queuesRestored;
     private boolean pausedByTransientLossOfFocus;
+
+    // --- Playback watchdog -------------------------------------------------
+    // On some devices the hardware offload output for a gapless MP3 track can
+    // stop consuming audio without reporting any error at all, leaving the
+    // player "playing" (isPlaying() == true) with a frozen position forever.
+    // The watchdog verifies that a track which is expected to be playing is
+    // actually making progress, and self-heals by re-opening the track when
+    // it is not (equivalent to the manual skip-forward-then-back workaround).
+    // See dumpsys media.audio_flinger: a frozen track shows an
+    // active track whose buffer is full and whose HAL frame count is stuck.
+    private volatile boolean expectPlayback = false;
+    private volatile long watchdogLastCheckElapsedMs = 0;
+    private volatile int watchdogLastPosition = -1;
+    private volatile long watchdogStuckElapsedMs = 0;
+    private volatile int watchdogRecoveries = 0;
+    private static final int WATCHDOG_MAX_RECOVERIES = 3;
+    private static final long WATCHDOG_INTERVAL_MS = 1000;
+    private static final long WATCHDOG_STUCK_THRESHOLD_MS = 8000;
+    private static final long WATCHDOG_PAST_END_MARGIN_MS = 5000;
+
     private PlayingNotification playingNotification;
     private AudioManager audioManager;
     @SuppressWarnings("deprecation")
@@ -471,6 +497,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
 
     private void quit() {
         pause();
+        disarmPlaybackWatchdog();
         playingNotification.stop();
 
         closeAudioEffectSession();
@@ -510,6 +537,9 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
 
     private boolean openSongAndPrepareNextAt(int position) {
         synchronized (this) {
+            if (this.position != position) {
+                watchdogRecoveries = 0;
+            }
             this.position = position;
             boolean prepared = openCurrent();
             if (prepared) prepareNextImpl();
@@ -857,12 +887,98 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         }
     }
 
+    /**
+     * Arm the playback watchdog. It periodically verifies that the track which
+     * is expected to be playing is actually making progress, and self-heals
+     * if it is not.
+     */
+    private void armPlaybackWatchdog() {
+        expectPlayback = true;
+        watchdogStuckElapsedMs = 0;
+        watchdogLastPosition = -1;
+        playerHandler.removeMessages(PLAYBACK_WATCHDOG);
+        playerHandler.sendEmptyMessageDelayed(PLAYBACK_WATCHDOG, WATCHDOG_INTERVAL_MS);
+    }
+
+    private void disarmPlaybackWatchdog() {
+        expectPlayback = false;
+        watchdogStuckElapsedMs = 0;
+        playerHandler.removeMessages(PLAYBACK_WATCHDOG);
+    }
+
+    /**
+     * One watchdog tick (runs on the playback handler thread).
+     */
+    private void runPlaybackWatchdog() {
+        if (!expectPlayback || playback == null) {
+            return;
+        }
+        if (!playback.isPlaying()) {
+            // Audio is expected but nothing is playing: resume it, or re-open
+            // the song if the player has died (or refuses to start) in the
+            // meantime.
+            if (playback.isInitialized() && playback.start()) {
+                Log.w(TAG, "watchdog: player not playing, resumed (song index " + getPosition() + ")");
+                armPlaybackWatchdog();
+            } else {
+                Log.w(TAG, "watchdog: player dead, re-opening song index " + getPosition());
+                playSongAt(getPosition());
+            }
+            return;
+        }
+        final int pos = playback.position();
+        final int dur = playback.duration();
+        if (dur > 0 && pos > dur + WATCHDOG_PAST_END_MARGIN_MS) {
+            // Position ran past the end of the track without completion firing:
+            // treat it as ended and advance to the next song.
+            Log.w(TAG, "watchdog: position " + pos + "ms past end of track (" + dur + "ms), advancing");
+            playNextSong(false);
+            return;
+        }
+        if (pos < 0) {
+            // Not available yet (still preparing): check again shortly.
+            playerHandler.sendEmptyMessageDelayed(PLAYBACK_WATCHDOG, WATCHDOG_INTERVAL_MS);
+            return;
+        }
+        final long now = SystemClock.elapsedRealtime();
+        if (watchdogLastPosition >= 0) {
+            final long dt = now - watchdogLastCheckElapsedMs;
+            if (dt > 0 && pos - watchdogLastPosition < dt / 2) {
+                // Less than roughly half-speed progress: the track is frozen.
+                watchdogStuckElapsedMs += dt;
+            } else {
+                watchdogStuckElapsedMs = 0;
+            }
+        }
+        watchdogLastPosition = pos;
+        watchdogLastCheckElapsedMs = now;
+        if (watchdogStuckElapsedMs >= WATCHDOG_STUCK_THRESHOLD_MS) {
+            if (watchdogRecoveries >= WATCHDOG_MAX_RECOVERIES) {
+                // This song keeps failing: stop and let the user decide.
+                Log.e(TAG, "watchdog: song index " + getPosition() + " failed " + WATCHDOG_MAX_RECOVERIES + " times, stopping");
+                pause();
+                Toast.makeText(this, getResources().getString(R.string.playback_stuck), Toast.LENGTH_LONG).show();
+                return;
+            }
+            watchdogRecoveries++;
+            // Re-open the current song: a fresh player and output stream recovers
+            // from the frozen state (equivalent to the manual
+            // skip-forward-then-back workaround).
+            Log.w(TAG, "watchdog: playback frozen " + WATCHDOG_STUCK_THRESHOLD_MS + "ms (position " + pos
+                    + "ms), re-opening song index " + getPosition() + " (recovery " + watchdogRecoveries + "/" + WATCHDOG_MAX_RECOVERIES + ")");
+            playSongAt(getPosition());
+            return;
+        }
+        playerHandler.sendEmptyMessageDelayed(PLAYBACK_WATCHDOG, WATCHDOG_INTERVAL_MS);
+    }
+
     public void pause() {
         pausedByTransientLossOfFocus = false;
         if (playback.isPlaying()) {
             playback.pause();
             notifyChange(PLAY_STATE_CHANGED);
         }
+        disarmPlaybackWatchdog();
     }
 
     public void play() {
@@ -873,6 +989,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
                         playSongAt(getPosition());
                     } else {
                         playback.start();
+                        armPlaybackWatchdog();
                         if (!becomingNoisyReceiverRegistered) {
                             registerReceiver(becomingNoisyReceiver, becomingNoisyReceiverIntentFilter);
                             becomingNoisyReceiverRegistered = true;
@@ -1171,6 +1288,12 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
         playerHandler.sendEmptyMessage(SONG_ENDED);
     }
 
+    @Override
+    public void onPlaybackError() {
+        acquireWakeLock(30000);
+        playerHandler.sendEmptyMessage(PLAYBACK_ERROR);
+    }
+
     private static final class PlaybackHandler extends Handler {
         @NonNull
         private final WeakReference<MusicService> mService;
@@ -1230,7 +1353,33 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
                         service.position = service.nextPosition;
                         service.prepareNextImpl();
                         service.notifyChange(META_CHANGED);
+                        // The new current player was auto-started by the framework:
+                        // verify it is actually producing audio.
+                        service.armPlaybackWatchdog();
                     }
+                    break;
+
+                case PLAYBACK_ERROR:
+                    // The current player reported an error; MultiPlayer discarded it.
+                    // Take over recovery so playback does not just die silently.
+                    if (service.pendingQuit || service.getRepeatMode() == REPEAT_MODE_NONE && service.isLastSong()) {
+                        service.pause();
+                        service.seek(0);
+                        if (service.pendingQuit) {
+                            service.pendingQuit = false;
+                            service.quit();
+                        }
+                    } else if (service.getRepeatMode() == REPEAT_MODE_ONE) {
+                        // Replaying the same broken file would loop forever: stop instead.
+                        service.pause();
+                    } else {
+                        service.playNextSong(false);
+                    }
+                    sendEmptyMessage(RELEASE_WAKELOCK);
+                    break;
+
+                case PLAYBACK_WATCHDOG:
+                    service.runPlaybackWatchdog();
                     break;
 
                 case SONG_ENDED:

@@ -299,14 +299,31 @@ public class MultiPlayer implements Playback, MediaPlayer.OnErrorListener, Media
      */
     @Override
     public boolean onError(final MediaPlayer mp, final int what, final int extra) {
-        mIsInitialized = false;
-        mCurrentMediaPlayer.release();
-        mCurrentMediaPlayer = new MediaPlayer();
-        mCurrentMediaPlayer.setWakeMode(context, PowerManager.PARTIAL_WAKE_LOCK);
+        Log.e(TAG, "onError: what=" + what + " extra=" + extra + " (current player: " + (mp == mCurrentMediaPlayer) + ")");
+        if (mp == mCurrentMediaPlayer) {
+            // The *current* player died. Discard it and let the service decide
+            // what to do (advance to the next song, or stop) — previously the
+            // service was never told, so it stayed desynchronized with the player.
+            mIsInitialized = false;
+            mCurrentMediaPlayer.release();
+            mCurrentMediaPlayer = new MediaPlayer();
+            mCurrentMediaPlayer.setWakeMode(context, PowerManager.PARTIAL_WAKE_LOCK);
+            if (callbacks != null) {
+                callbacks.onPlaybackError();
+            }
+        } else {
+            // The *next* player failed. Just drop it: when the current song ends,
+            // onCompletion sees mNextMediaPlayer == null and calls onSongEnded(),
+            // so the service starts the next song with a fresh open.
+            if (mNextMediaPlayer != null) {
+                mNextMediaPlayer.release();
+                mNextMediaPlayer = null;
+            }
+        }
         if (context != null) {
             Toast.makeText(context, context.getResources().getString(R.string.unplayable_file), Toast.LENGTH_SHORT).show();
         }
-        return false;
+        return true;
     }
 
     /**
