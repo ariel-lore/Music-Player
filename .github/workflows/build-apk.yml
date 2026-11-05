@@ -33,7 +33,8 @@ jobs:
           sed -i 's|jcenter()|mavenCentral()\n        maven { url "https://maven.aliyun.com/repository/jcenter" }|' build.gradle
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        # gradlew is committed without the executable bit, so invoke via sh
+        run: sh gradlew :app:assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
