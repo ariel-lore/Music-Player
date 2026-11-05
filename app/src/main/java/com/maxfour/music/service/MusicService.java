@@ -1369,7 +1369,7 @@ public class MusicService extends Service implements SharedPreferences.OnSharedP
                             service.pendingQuit = false;
                             service.quit();
                         }
-                    } else if (service.getRepeatMode() == REPEAT_MODE_ONE) {
+                    } else if (service.getRepeatMode() == REPEAT_MODE_THIS) { // repeat-one
                         // Replaying the same broken file would loop forever: stop instead.
                         service.pause();
                     } else {
