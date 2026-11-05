@@ -19,7 +19,12 @@ jobs:
           java-version: '11'
 
       - name: Install Android SDK components
+        # The runner's sdkmanager is built for JDK 17 (class file 61), while the
+        # 2020-era Gradle/AGP build needs JDK 11. Use JDK 17 for this step only
+        # (JAVA_HOME_17_X64 is preinstalled on the ubuntu runner); the build step
+        # below still gets JDK 11 from the setup-java action.
         run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30" "build-tools;30.0.2"
 
